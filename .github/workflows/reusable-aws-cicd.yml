@@ -58,34 +58,156 @@ on:
     outputs:
       image_tag:
         description: Final image tag used
-        value: ${{ jobs.ci.outputs.image_tag }}
+        value: ${{ jobs.build.outputs.image_tag }}
       image_uri:
         description: ECR image URI with tag
-        value: ${{ jobs.ci.outputs.image_uri }}
+        value: ${{ jobs.build.outputs.image_uri }}
       image_digest:
         description: Pushed image digest
-        value: ${{ jobs.ci.outputs.image_digest }}
+        value: ${{ jobs.build.outputs.image_digest }}
 
 jobs:
-  ci:
-    name: CI/CD
+  scan:
+    name: Scan and test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
-      id-token: write          # OIDC
       contents: read
-      security-events: write   # CodeQL SARIF upload
+      security-events: write
+    steps:
+      - name: Validate ECS inputs
+        if: ${{ inputs.enable-ecs-deploy == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+
+          [ -n "${{ inputs.ecs-cluster }}" ] || missing+=("ecs-cluster")
+          [ -n "${{ inputs.ecs-service }}" ] || missing+=("ecs-service")
+          [ -n "${{ inputs.ecs-container-name }}" ] || missing+=("ecs-container-name")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing required deploy inputs when enable-ecs-deploy is true: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Lint and Test
+        if: ${{ inputs.test-command != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.test-command }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          dependency-caching: true
+          languages: ${{ inputs.codeql-languages }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+
+      - name: Analyze
+        id: codeql-analyze
+        uses: github/codeql-action/analyze@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          category: '/language:multi'
+          output: sarif-results
+
+      - name: Fail on CodeQL High/Critical
+        env:
+          SARIF_DIR: ${{ steps.codeql-analyze.outputs.sarif-output }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          sarif_dir = Path(os.environ["SARIF_DIR"])
+          if not sarif_dir.exists():
+              print(f"SARIF output directory not found: {sarif_dir}", file=sys.stderr)
+              sys.exit(1)
+
+          findings = []
+
+          for sarif_file in sarif_dir.rglob("*.sarif"):
+              with sarif_file.open(encoding="utf-8") as handle:
+                  document = json.load(handle)
+
+              for run in document.get("runs", []):
+                  rule_severity = {}
+                  for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
+                      severity = rule.get("properties", {}).get("security-severity")
+                      if severity is None:
+                          continue
+                      try:
+                          rule_severity[rule["id"]] = float(str(severity))
+                      except (KeyError, TypeError, ValueError):
+                          continue
+
+                  for result in run.get("results", []):
+                      severity = result.get("properties", {}).get("security-severity")
+                      if severity is None:
+                          severity = rule_severity.get(result.get("ruleId", ""))
+
+                      try:
+                          severity = float(str(severity))
+                      except (TypeError, ValueError):
+                          continue
+
+                      if severity < 7.0:
+                          continue
+
+                      message = result.get("message", {}).get("text", "CodeQL finding")
+                      findings.append(
+                          f"{sarif_file.name}: {result.get('ruleId', 'unknown-rule')} "
+                          f"(security severity {severity:.1f}) - {message}"
+                      )
+
+          if findings:
+              print("CodeQL found High/Critical results:", file=sys.stderr)
+              for finding in findings[:20]:
+                  print(f"- {finding}", file=sys.stderr)
+              if len(findings) > 20:
+                  print(f"- ...and {len(findings) - 20} more", file=sys.stderr)
+              sys.exit(1)
+
+          print("CodeQL gate passed with no High/Critical results.")
+          PY
+
+      - name: Trivy scan (source)
+        uses: ./.github/actions/trivy-scan
+        with:
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+  build:
+    name: Build and publish
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       image_tag: ${{ steps.vars.outputs.tag }}
       image_uri: ${{ steps.img.outputs.uri }}
       image_digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Compute image tag
         id: vars
         shell: bash
         run: |
+          set -euo pipefail
           if [ -n "${{ inputs.image-tag }}" ]; then
             TAG="${{ inputs.image-tag }}"
           else
@@ -99,36 +221,13 @@ jobs:
           aws-role-to-assume: ${{ inputs.aws-role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Lint and Test
-        if: ${{ inputs.test-command != '' }}
-        run: ${{ inputs.test-command }}
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: ${{ inputs.codeql-languages }}
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
-
-      - name: Analyze
-        uses: github/codeql-action/analyze@v4
-        with:
-          category: '/language:multi'
-
-      - name: Trivy scan (source)
-        uses: ./.github/actions/trivy-scan
-        with:
-          severity: CRITICAL,HIGH
-          exit-code: '1'
-
       - name: Login to ECR
         id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@006813a119ae0fdeb70ae00f16cda21ee6f2ff3d
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository-name }}
           tags: |
@@ -140,51 +239,114 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile-path }}
+          labels: ${{ steps.meta.outputs.labels }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
 
       - name: Compute image URI
         id: img
         shell: bash
         run: |
+          set -euo pipefail
           echo "uri=${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository-name }}:${{ steps.vars.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Trivy scan (image)
         uses: ./.github/actions/trivy-scan
         with:
           image-ref: ${{ steps.img.outputs.uri }}
+          scan-source: 'false'
           severity: CRITICAL,HIGH
           exit-code: '1'
 
+  deploy:
+    name: Deploy to ECS
+    if: ${{ inputs.enable-ecs-deploy == true }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: ./.github/actions/aws-oidc-credentials
+        with:
+          aws-role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
       - name: Deploy to ECS
-        if: ${{ inputs.enable-ecs-deploy == true }}
         env:
           CLUSTER: ${{ inputs.ecs-cluster }}
           SERVICE: ${{ inputs.ecs-service }}
           CONTAINER: ${{ inputs.ecs-container-name }}
-          IMAGE: ${{ steps.img.outputs.uri }}
+          IMAGE: ${{ needs.build.outputs.image_uri }}
         shell: bash
         run: |
-          if [ -z "$CLUSTER" ] || [ -z "$SERVICE" ] || [ -z "$CONTAINER" ]; then
-            echo "ECS deploy requested but ecs-cluster/service/container-name not provided." >&2
+          set -euo pipefail
+          TD_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
+          if [ -z "$TD_ARN" ] || [ "$TD_ARN" = "None" ]; then
+            echo "Unable to resolve task definition for ECS service '$SERVICE' in cluster '$CLUSTER'." >&2
             exit 1
           fi
-          sudo apt-get update && sudo apt-get install -y jq
-          TD_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
-          aws ecs describe-task-definition --task-definition "$TD_ARN" --query 'taskDefinition' > td.json
-          jq --arg IMAGE "$IMAGE" --arg NAME "$CONTAINER" '
-            .containerDefinitions = (.containerDefinitions | map(if .name == $NAME then .image = $IMAGE else . end))
-            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
-          ' td.json > new-td.json
+
+          aws ecs describe-task-definition --task-definition "$TD_ARN" --query 'taskDefinition' --output json > td.json
+
+          python <<'PY'
+          import json
+          import os
+          import sys
+
+          container_name = os.environ["CONTAINER"]
+          image = os.environ["IMAGE"]
+
+          with open("td.json", encoding="utf-8") as handle:
+              task_definition = json.load(handle)
+
+          container_found = False
+          for container in task_definition.get("containerDefinitions", []):
+              if container.get("name") == container_name:
+                  container["image"] = image
+                  container_found = True
+                  break
+
+          if not container_found:
+              print(
+                  f"Container '{container_name}' not found in task definition for service.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          for field in (
+              "taskDefinitionArn",
+              "revision",
+              "status",
+              "requiresAttributes",
+              "compatibilities",
+              "registeredAt",
+              "registeredBy",
+          ):
+              task_definition.pop(field, None)
+
+          with open("new-td.json", "w", encoding="utf-8") as handle:
+              json.dump(task_definition, handle)
+          PY
+
           NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://new-td.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          if [ -z "$NEW_TD_ARN" ] || [ "$NEW_TD_ARN" = "None" ]; then
+            echo "ECS task definition registration failed." >&2
+            exit 1
+          fi
+
           aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEW_TD_ARN"
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
           echo "Updated $SERVICE to $NEW_TD_ARN"

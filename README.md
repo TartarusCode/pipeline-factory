@@ -1,12 +1,12 @@
 # Pipeline Factory
 
-A centralized, secure set of GitHub reusable workflows and composite actions that hundreds of services can consume to lint, test, scan, build, push, and optionally deploy containerized apps — without managing cloud secrets.
+A centralized, secure set of GitHub reusable workflows and composite actions that hundreds of services can consume to lint, test, scan, build, push, and optionally deploy containerized apps without managing cloud secrets.
 
 ## How it works
 
-- **OIDC Authentication**: Uses GitHub OIDC to assume AWS roles (no long-lived credentials)
-- **Security Scanning**: CodeQL SAST and Trivy scans enforced (fail on HIGH/CRITICAL)
-- **Container Build**: Build and push image to ECR with optional ECS deployment
+- **OIDC Authentication**: Uses GitHub OIDC to assume AWS roles only in AWS-bound jobs (no long-lived credentials)
+- **Security Scanning**: CodeQL SARIF results and Trivy scans fail the workflow on HIGH/CRITICAL findings
+- **Container Build**: Build and push images to ECR with GitHub Actions cache-backed Docker layers
 - **Reusable Components**: Composite actions for common operations
 
 ## Repository Structure
@@ -52,8 +52,9 @@ pipeline-factory/
 
 ## Secrets
 
-- Callers use `secrets: inherit` to pass any needed repo/org secrets
-- No static AWS secrets required (OIDC only)
+- No static AWS secrets required for AWS authentication; the workflow uses OIDC only
+- Callers should not use `secrets: inherit` by default
+- If tests need secrets, pass only the specific secrets required by the caller workflow
 
 ## Usage Example
 
@@ -64,9 +65,14 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
 jobs:
   build-and-deploy:
-    uses: your-github-org/pipeline-factory/.github/workflows/reusable-aws-cicd.yml@v1
+    uses: your-github-org/pipeline-factory/.github/workflows/reusable-aws-cicd.yml@<immutable-release-sha>
     with:
       aws-role-to-assume: arn:aws:iam::123456789012:role/PipelineFactoryDeployerRole
       aws-region: us-east-1
@@ -75,7 +81,6 @@ jobs:
       context: .
       test-command: 'npm ci && npm test'
       enable-ecs-deploy: false
-    secrets: inherit
 ```
 
 ### Deploy to ECS
@@ -92,9 +97,10 @@ with:
 
 ## Security Posture
 
-- **No long-lived credentials**: Uses OIDC for AWS authentication
-- **Mandatory security scans**: CodeQL SAST and Trivy container scans
-- **Fail on critical issues**: Build fails on HIGH/CRITICAL security findings
+- **No long-lived credentials**: Uses OIDC for AWS authentication and only requests AWS credentials in build/deploy jobs
+- **Mandatory security scans**: CodeQL and Trivy both run before release or deployment
+- **Fail-fast enforcement**: The workflow parses CodeQL SARIF locally and fails on HIGH/CRITICAL findings; Trivy also exits non-zero on HIGH/CRITICAL findings
+- **Immutable dependencies**: Third-party actions are pinned to full commit SHAs to reduce supply-chain risk
 - **Standardized pipeline**: Reduces configuration drift across services
 
 ## Prerequisites
@@ -108,8 +114,9 @@ with:
 ## Versioning
 
 - Create release tags after testing (e.g., `v1.0.0`)
-- Create moving major tags `v1` pointing to latest stable release
-- Callers should pin to `@v1` (or commit SHA for stricter pinning)
+- Create moving major tags `v1` pointing to the latest stable release
+- Prefer pinning callers to an immutable release commit SHA
+- Use moving tags like `@v1` only when you explicitly accept the trade-off of automatic updates
 
 ## Contributing
 
