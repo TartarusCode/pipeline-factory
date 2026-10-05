@@ -112,7 +112,7 @@ jobs:
 
       - name: Analyze
         id: codeql-analyze
-        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938
         with:
           category: '/language:multi'
           output: sarif-results
