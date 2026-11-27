@@ -102,7 +102,7 @@ jobs:
           ${{ inputs.test-command }}
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d
+        uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934
         with:
           dependency-caching: true
           languages: ${{ inputs.codeql-languages }}
